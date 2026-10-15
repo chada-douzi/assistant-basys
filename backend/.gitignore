@@ -1,0 +1,22 @@
+﻿node_modules/
+dist/
+.env
+
+# Variables d'environnement et secrets
+.env
+.env.*
+!.env.example
+
+# Dépendances et compilation
+node_modules/
+dist/
+
+# Logs et fichiers temporaires
+*.log
+npm-debug.log*
+coverage/
+
+# Fichiers système et éditeurs
+.DS_Store
+Thumbs.db
+.vscode/

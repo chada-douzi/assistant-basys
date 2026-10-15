@@ -1,0 +1,394 @@
+﻿import "dotenv/config";
+import express from "express";
+import mongoose from "mongoose";
+import cors from "cors";
+import { KnowledgeDocument } from "./models/KnowledgeDocument.js";
+import { generateAnswer } from "./services/llm.js";
+
+const app = express();
+const port = Number(process.env.PORT ?? 3000);
+const mongoUri = process.env.MONGODB_URI;
+
+const ollamaUrl = process.env.OLLAMA_URL ?? "http://127.0.0.1:11434";
+const ollamaModel = process.env.OLLAMA_MODEL ?? "qwen2.5:3b";
+
+app.use(cors());
+app.use(express.json({ limit: "20kb" }));
+
+// Route existante : état du serveur
+app.get("/api/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    service: "assistant-basys-api",
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Route existante : recherche documentaire
+app.get("/api/knowledge", async (req, res) => {
+  const query = typeof req.query.q === "string"
+    ? req.query.q.trim()
+    : "";
+
+  if (query.length < 2) {
+    res.status(400).json({
+      error: "La recherche doit contenir au moins 2 caractères.",
+      example: "/api/knowledge?q=maintenance"
+    });
+    return;
+  }
+
+  if (query.length > 100) {
+    res.status(400).json({
+      error: "La recherche ne doit pas dépasser 100 caractères."
+    });
+    return;
+  }
+
+  try {
+    // Normaliser les accents pour une recherche insensible aux accents
+    const normalizeForSearch = (text: string): string =>
+      text
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLocaleLowerCase("fr");
+
+    const normalizedQuery = normalizeForSearch(query);
+    const escapedQuery = normalizedQuery.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
+    );
+    const pattern = new RegExp(escapedQuery, "i");
+
+    // Récupérer tous les documents pour filtrer avec normalisation
+    const allDocs = await KnowledgeDocument.find({})
+      .select("slug title category content source tags")
+      .lean();
+
+    // Filtrer en normalisant les champs
+    const results = allDocs
+      .filter((doc) => {
+        const searchableFields = [
+          normalizeForSearch(doc.title),
+          normalizeForSearch(doc.content),
+          normalizeForSearch(doc.category),
+          normalizeForSearch(doc.source),
+          ...(doc.tags ?? []).map(normalizeForSearch)
+        ];
+        
+        return searchableFields.some((field) => pattern.test(field));
+      })
+      .slice(0, 5);
+
+    res.json({
+      query,
+      count: results.length,
+      results
+    });
+  } catch (error) {
+    console.error("Erreur de recherche documentaire :", error);
+    res.status(500).json({
+      error: "Impossible d'effectuer la recherche documentaire."
+    });
+  }
+});
+
+// Nouvelle route : assistant conversationnel avec RAG + Ollama
+app.post("/api/chat", async (req, res) => {
+  const question = typeof req.body?.question === "string"
+    ? req.body.question.trim()
+    : "";
+
+  if (question.length < 2) {
+    res.status(400).json({
+      error: "La question doit contenir au moins 2 caractères."
+    });
+    return;
+  }
+
+  if (question.length > 1000) {
+    res.status(400).json({
+      error: "La question ne doit pas dépasser 1000 caractères."
+    });
+    return;
+  }
+
+  try {
+    // 1. Extraire les mots utiles de la question
+    const stopWords = new Set([
+      "que", "quoi", "qui", "comment", "pourquoi", "quand",
+      "faire", "faut", "peut", "peux", "dois", "est", "sont",
+      "dans", "pour", "avec", "sans", "sur", "sous", "chez",
+      "les", "des", "une", "un", "la", "le", "du", "de",
+      "en", "et", "ou", "au", "aux", "ce", "ces", "cette",
+      "mon", "ma", "mes", "son", "sa", "ses", "je", "tu",
+      "il", "elle", "nous", "vous", "ils", "elles", "on",
+      "y", "a", "d", "l", "ne", "pas", "plus", "cas"
+    ]);
+
+    const words: string[] = question
+      .toLocaleLowerCase("fr")
+      .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+      .split(/\s+/);
+
+    const terms: string[] = [
+      ...new Set(
+        words.filter(
+          (term: string) => term.length >= 3 && !stopWords.has(term)
+        )
+      )
+    ].slice(0, 10);
+
+    if (terms.length === 0) {
+      res.json({
+        question,
+        answer: "Peux-tu reformuler ta question en précisant le sujet recherché ?",
+        sources: []
+      });
+      return;
+    }
+
+    // 2. Rechercher les documents pertinents dans MongoDB
+    // Fonction de normalisation pour recherche insensible aux accents
+    const normalizeText = (value: unknown): string =>
+      String(value ?? "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLocaleLowerCase("fr");
+
+    const normalizedTerms = terms.map(normalizeText);
+
+    // Récupérer tous les documents pour filtrer avec normalisation
+    const allDocs = await KnowledgeDocument.find({})
+      .select("slug title category content source tags")
+      .lean();
+
+    // Filtrer en normalisant les champs
+    const candidates = allDocs.filter((doc) => {
+      const searchableFields = [
+        normalizeText(doc.title),
+        normalizeText(doc.content),
+        normalizeText(doc.category),
+        ...(doc.tags ?? []).map(normalizeText)
+      ];
+      
+      return normalizedTerms.some(normalizedTerm => 
+        searchableFields.some(field => field.includes(normalizedTerm))
+      );
+    });
+
+const equipmentIds = [
+  ...new Set(question.match(/\b[A-Z]{2,}-\d+\b/gi) ?? [])
+].map(normalizeText);
+
+const candidatesForScoring = equipmentIds.length > 0
+  ? candidates.filter((doc) => {
+      const searchableText = normalizeText([
+        doc.title,
+        doc.content,
+        ...(doc.tags ?? [])
+      ].join(" "));
+
+      return equipmentIds.some((id) => searchableText.includes(id));
+    })
+  : candidates;
+
+const scoreDocument = (
+  doc: (typeof candidates)[number]
+): number => {
+  const title = normalizeText(doc.title);
+  const category = normalizeText(doc.category);
+  const content = normalizeText(doc.content);
+  const tags = (doc.tags ?? []).map(normalizeText);
+
+  let score = 0;
+
+  for (const term of terms) {
+    const normalizedTerm = normalizeText(term);
+
+    if (title.includes(normalizedTerm)) score += 8;
+    if (tags.some((tag) => tag.includes(normalizedTerm))) score += 5;
+    if (category.includes(normalizedTerm)) score += 2;
+    if (content.includes(normalizedTerm)) score += 1;
+  }
+
+  // Une référence exacte d'équipement est prioritaire.
+  for (const id of equipmentIds) {
+    if (title.includes(id)) score += 1000;
+    else if (content.includes(id)) score += 800;
+    else if (tags.some((tag) => tag.includes(id))) score += 600;
+  }
+
+  return score;
+};
+
+const documents = candidatesForScoring
+  .map((doc) => ({
+    doc,
+    score: scoreDocument(doc)
+  }))
+  .filter((item) => item.score >= 3)
+  .sort((a, b) => b.score - a.score)
+  .slice(0, 5)
+  .map((item) => item.doc);
+
+
+
+    if (documents.length === 0) {
+      res.json({
+        question,
+        answer: "Je n’ai pas trouvé d’information pertinente dans la base documentaire de démonstration pour répondre à cette question. Ajoute des documents adaptés ou reformule ta question.",
+        sources: []
+      });
+      return;
+    }
+
+    // 3. Préparer le contexte transmis au modèle
+    const context = documents.map((doc) =>
+      `Titre exact du document : ${doc.title}
+Catégorie : ${doc.category}
+Source : ${doc.source}
+Contenu : ${doc.content}`
+    ).join("\n\n---\n\n");
+
+const systemPrompt = `
+Tu es un assistant conversationnel de démonstration destiné à aider
+les utilisateurs à comprendre des informations et des procédures
+techniques à partir d'une base documentaire.
+
+LANGUE ET STYLE
+- Réponds en français, de manière claire, concise et structurée.
+- Adapte le niveau de détail à la question.
+- Ne répète pas inutilement la question.
+RÈGLES DE FIABILITÉ
+- Utilise uniquement les informations explicitement présentes dans
+  les documents fournis.
+- N'ajoute aucune étape, valeur, date, durée, référence, commande,
+  fonctionnalité ou procédure qui n'est pas documentée.
+- Ne présente pas une connaissance générale comme une information
+  confirmée par les documents.
+- Ne déduis pas qu'une procédure existe simplement parce qu'elle
+  serait habituelle dans un autre logiciel ou équipement.
+- Si une information demandée est absente, indique précisément
+  ce qui manque au lieu de compléter la réponse par supposition.
+- Si les documents ne répondent que partiellement à la question,
+  donne uniquement les éléments confirmés, puis signale les limites.
+- Si aucun document n'est réellement pertinent, indique que la base
+  documentaire ne permet pas de répondre à la question.
+RÈGLES CONTRE LES DÉDUCTIONS NON JUSTIFIÉES
+- Ne déduis jamais une cause, une conséquence, une action en cours
+  ou une explication à partir d'un simple statut.
+- Exemple : "en observation" signifie uniquement que le statut indiqué
+  dans le document est "en observation". Ne dis pas que l'équipement
+  est en cours d'évaluation, de surveillance ou de réparation si cela
+  n'est pas explicitement écrit.
+- Ne transforme pas une donnée descriptive en diagnostic technique.
+- Ne présente pas une hypothèse comme un fait, même si elle paraît
+  logique ou habituelle.
+- Pour une donnée absente, indique clairement qu'elle n'est pas
+  renseignée dans les documents disponibles.
+- Pour citer une source, utilise son titre exact fourni dans le contexte.
+  Évite les expressions vagues comme "Document 1" lorsque son titre
+  est disponible.
+UTILISATION DES SOURCES
+- Distingue les faits explicitement documentés des informations
+  qui ne sont pas disponibles.
+- Ne prétends pas qu'un document confirme une information qu'il
+  ne contient pas.
+- Lorsque c'est utile, mentionne le titre du document utilisé.
+- N'invente jamais une source, une citation ou un extrait.
+LIMITES DU PROTOTYPE
+- Les documents fournis sont des données de démonstration et ne
+  constituent pas une documentation officielle de BaSYS.
+- Ne prétends jamais être connecté au véritable système BaSYS.
+- Ne prétends pas avoir consulté des données réelles, modifié une
+  configuration ou exécuté une action sur un équipement.
+- Pour une procédure officielle absente des documents, invite
+  l'utilisateur à consulter la documentation appropriée.
+Avant de répondre, vérifie que chaque affirmation factuelle est
+justifiée par le contenu des documents fournis.
+Si elle ne l'est pas, supprime-la ou indique explicitement que
+l'information n'est pas disponible.
+`.trim();
+
+
+    const userPrompt = `
+Question de l'utilisateur :
+${question}
+
+Documents disponibles :
+${context}
+
+Réponds à la question en utilisant uniquement ces documents.
+    `.trim();
+
+    // 4. Générer la réponse avec le fournisseur IA configuré
+    const answer = await generateAnswer({
+      systemPrompt,
+      userPrompt
+    });
+
+    if (!answer) {
+      res.status(502).json({
+        error: "Le modèle n'a retourné aucune réponse."
+      });
+      return;
+    }
+    
+    // Construire la liste des titres distincts
+    const sourceTitles = [
+      ...new Set(
+        documents
+          .map((doc) => doc.title)
+          .filter((title): title is string => Boolean(title))
+      )
+    ];
+    
+    // 5. Retourner la réponse et les sources réellement consultées
+    res.json({
+      question,
+      answer: `${answer.trim()}\n\nSources consultées : ${sourceTitles.join(" ; ")}`,
+      sources: documents.map(doc => ({
+        slug: doc.slug,
+        title: doc.title,
+        category: doc.category,
+        source: doc.source
+      }))
+    });
+  } catch (error) {
+    console.error("Erreur dans /api/chat :", error);
+
+    const isTimeout = error instanceof Error && error.name === "TimeoutError";
+
+    res.status(isTimeout ? 504 : 500).json({
+      error: isTimeout
+        ? "Le modèle a mis trop de temps à répondre. Réessaie."
+        : "Impossible de traiter la question. Vérifie MongoDB et Ollama."
+    });
+  }
+});
+
+async function startServer(): Promise<void> {
+  if (!mongoUri) {
+    throw new Error("La variable MONGODB_URI est absente du fichier .env");
+  }
+
+  await mongoose.connect(mongoUri);
+  console.log("MongoDB connecté.");
+
+  app.listen(port, "127.0.0.1", () => {
+    console.log(`API disponible sur http://127.0.0.1:${port}`);
+    console.log(`Recherche : http://127.0.0.1:${port}/api/knowledge?q=maintenance`);
+    console.log(`Assistant : http://127.0.0.1:${port}/api/chat`);
+    console.log(`Modèle local : ${ollamaModel}`);
+  });
+}
+
+startServer().catch((error: unknown) => {
+  console.error("Impossible de démarrer le serveur :", error);
+  process.exitCode = 1;
+});
+
+
+
+
