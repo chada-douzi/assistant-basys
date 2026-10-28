@@ -69,13 +69,13 @@ export function hasExhaustiveKeyword(question: string): boolean {
 export function extractSearchTerms(question: string, maxTerms: number = 10): string[] {
   const normalized = normalizeText(question);
   const words = normalized.split(/\s+/).filter((w: string) => w.length > 0);
-  
+
   const terms = [
     ...new Set(
       words.filter((term: string) => term.length >= 3 && !STOP_WORDS.has(term))
     )
   ].slice(0, maxTerms);
-  
+
   return terms;
 }
 
@@ -147,13 +147,13 @@ export function scoreDocument(doc: ScoredDocument, params: ScoringParams): numbe
     score += 50;
   }
   if (params.hasMaintenanceInQuestion && category === "maintenance") {
-    score += 30;
+    score += 5; // Légère préférence catégorie maintenance, sans écraser la correspondance de titre
   }
 
   // Scoring basique par emplacement
   for (const term of params.terms) {
     const normalizedTerm = normalizeText(term);
-    
+
     if (title.includes(normalizedTerm)) {
       score += 10;
     }
