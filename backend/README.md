@@ -54,7 +54,7 @@ OLLAMA_MODEL=qwen2.5:3b
 |---|---|---|
 | `PORT` | `3000` | Port d'écoute de l'API |
 | `MONGODB_URI` | — | URI de connexion MongoDB (obligatoire) |
-| `LLM_PROVIDER` | `ollama` | Fournisseur LLM : `ollama` ou `claude` |
+| `LLM_PROVIDER` | `ollama` | Fournisseur LLM : `ollama` uniquement |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | URL du serveur Ollama local |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | Modèle Ollama à utiliser |
 
@@ -236,7 +236,7 @@ backend/
 ├── src/
 │   ├── server.ts            # Express — routes et pipeline RAG
 │   ├── services/
-│   │   └── llm.ts           # Appels Ollama / Claude
+│   │   └── llm.ts           # Appels au modèle local Ollama
 │   ├── models/
 │   │   └── KnowledgeDocument.ts  # Schéma Mongoose
 │   ├── equipment-summary.ts  # Extraction structurée des fiches équipements

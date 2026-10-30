@@ -1,4 +1,3 @@
-import Anthropic from "@anthropic-ai/sdk";
 
 const provider = (process.env.LLM_PROVIDER ?? "ollama").toLowerCase();
 
@@ -24,58 +23,13 @@ export async function generateAnswer({
   systemPrompt,
   userPrompt
 }: LlmInput): Promise<LlmResult> {
-  if (provider === "claude") {
-    return generateWithClaude(systemPrompt, userPrompt);
-  }
-
   if (provider === "ollama") {
     return generateWithOllama(systemPrompt, userPrompt);
   }
 
   throw new Error(
-    `Fournisseur IA inconnu : ${provider}. Utilisez ollama ou claude.`
+    `Fournisseur IA inconnu : ${provider}. Utilisez ollama.`
   );
-}
-
-async function generateWithClaude(
-  systemPrompt: string,
-  userPrompt: string
-): Promise<LlmResult> {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error(
-      "ANTHROPIC_API_KEY est absente. Configurez un accès API Anthropic valide."
-    );
-  }
-
-  const client = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY
-  });
-
-  const model = process.env.CLAUDE_MODEL;
-
-  if (!model) {
-    throw new Error(
-      "CLAUDE_MODEL est absent. Configurez un identifiant de modèle disponible sur votre compte API."
-    );
-  }
-
-  const response = await client.messages.create({
-    model,
-    max_tokens: 1024,
-    system: systemPrompt,
-    messages: [{ role: "user", content: userPrompt }]
-  });
-
-  const answer = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("\n")
-    .trim();
-
-  // Claude indique la troncature via stop_reason === "max_tokens"
-  const truncated = response.stop_reason === "max_tokens";
-
-  return { answer, truncated };
 }
 
 async function generateWithOllama(
